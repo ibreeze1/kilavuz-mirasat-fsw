@@ -146,14 +146,20 @@ class SigmaMotorActuator:
         telemetri) bloklanmaz. ACK best-effort (non-blocking) okunur.
         """
         try:
-            # command_long_send(target_system, target_component, command, confirmation,
-            #   p1=başlangıç motoru, p2=gaz tipi(%), p3=gaz, p4=süre/motor,
-            #   p5=motor sayısı, p6=test sırası, p7=0)
-            conn.mav.command_long_send(
-                conn.target_system, conn.target_component,
-                MAV_CMD_DO_MOTOR_TEST, 0,
-                1.0, float(MOTOR_TEST_THROTTLE_PERCENT), float(pct), float(secs),
-                float(MOTOR_COUNT), float(MOTOR_TEST_ORDER_SEQUENCE), 0.0)
+            # ArduCopter 3.5.8 TOPLU motor testini DESTEKLEMEZ: param5 (motor
+            # sayisi) ve param6 (sira bayragi) YOK SAYILIR ve yalnizca param1'deki
+            # motor doner. Sahada dogrulandi (2026-08-11): param5=4/param6=1 ile
+            # tek motor calisti, dort ayri komutla dordu de calisti.
+            #
+            # Bu yuzden her motora AYRI komut gonderilir. Komutlar arka arkaya
+            # gittigi icin dort motor ES ZAMANLI doner.
+            for motor in range(1, MOTOR_COUNT + 1):
+                conn.mav.command_long_send(
+                    conn.target_system, conn.target_component,
+                    MAV_CMD_DO_MOTOR_TEST, 0,
+                    float(motor), float(MOTOR_TEST_THROTTLE_PERCENT),
+                    float(pct), float(secs),
+                    0.0, 0.0, 0.0)
         except Exception as exc:  # pragma: no cover - donanıma özgü G/Ç hataları
             self._log(f"SIGMA ACTUATOR: komut gönderilemedi: {exc}")
             return Result.err(ErrorCode.IO_ERROR, f"DO_MOTOR_TEST gönderilemedi: {exc}")
@@ -163,8 +169,8 @@ class SigmaMotorActuator:
         result = getattr(ack, "result", None) if ack is not None else None
         if result == MAV_RESULT_ACCEPTED:
             self._log(f"SIGMA ACTUATOR: DO_MOTOR_TEST ACCEPTED — %{pct:.0f}, "
-                      f"{MOTOR_COUNT} motor sırayla {secs:.1f} sn (PERVANESİZ doğrula)")
+                      f"{MOTOR_COUNT} motor es zamanli {secs:.1f} sn")
         else:
             self._log(f"SIGMA ACTUATOR: DO_MOTOR_TEST gönderildi (%{pct:.0f}, "
-                      f"{MOTOR_COUNT} motor); ACK henüz yok — motor dönüşünü GÖZLE")
+                      f"{MOTOR_COUNT} motor es zamanli); motor dönüşünü GÖZLE")
         return Result.ok(None)

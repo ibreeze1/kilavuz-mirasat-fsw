@@ -22,12 +22,14 @@ from src.services.s2d_iot import S2dIotService
 _SEPARATION_ALIASES = {"SEP", "MANUAL_SEP", "MANUAL_SEPARATION", "AYIR"}
 _APAM_ALIASES = {"APAM", "MANUAL_APAM", "PARASUT", "PARACHUTE"}
 _SIGMA_ALIASES = {"SIGMA", "SIGMA_TEST", "MOTOR", "MOTOR_TEST", "SIGMA_TETIK"}
+_SIGMA_STOP_ALIASES = {"MOTOR_STOP", "SIGMA_STOP", "ESTOP", "DUR"}
 
 
 class CommandKind(Enum):
     MANUAL_SEPARATION = "MANUAL_SEPARATION"
     MANUAL_APAM = "MANUAL_APAM"
     MANUAL_SIGMA = "MANUAL_SIGMA"
+    MANUAL_SIGMA_STOP = "MANUAL_SIGMA_STOP"
     S2D_IOT = "S2D_IOT"
 
 
@@ -49,6 +51,8 @@ class CommandService:
         self._manual_separation = False
         self._manual_apam = False
         self._sigma_count = 0
+        self._sigma_stop_count = 0
+        self._sigma_running = False
         self.handled_count = 0
 
     @property
@@ -68,6 +72,15 @@ class CommandService:
         """
         return self._sigma_count
 
+    @property
+    def sigma_stop_count(self) -> int:
+        return self._sigma_stop_count
+
+    @property
+    def sigma_running(self) -> bool:
+        """SIGMA testi su an aktif mi? Ana dongu buna gore komutu yeniler."""
+        return self._sigma_running
+
     def handle(self, command: str) -> Result[CommandResult]:
         if not isinstance(command, str) or not command.strip():
             return Result.err(ErrorCode.INVALID_DATA, "boş komut")
@@ -83,9 +96,20 @@ class CommandService:
             self.handled_count += 1
             return Result.ok(CommandResult(CommandKind.MANUAL_APAM,
                                            "manuel APAM latch'lendi"))
+        if token in _SIGMA_STOP_ALIASES:
+            # Acil durdurma: latch DEGIL, her komutta sayac artar. Operator
+            # arka arkaya basabilmeli - bir kez durdurup tekrar durdurmak
+            # istemesi mesru bir istektir.
+            self._sigma_stop_count += 1
+            self._sigma_running = False
+            self.handled_count += 1
+            return Result.ok(CommandResult(CommandKind.MANUAL_SIGMA_STOP,
+                                           f"SİGMA motor DURDURMA (#{self._sigma_stop_count})"))
+
         if token in _SIGMA_ALIASES:
             # QR tezgah demosu: motor yer-testini tetikle (latch değil, sayaç++).
             self._sigma_count += 1
+            self._sigma_running = True
             self.handled_count += 1
             return Result.ok(CommandResult(CommandKind.MANUAL_SIGMA,
                                            f"SİGMA motor testi tetiklendi (#{self._sigma_count})"))

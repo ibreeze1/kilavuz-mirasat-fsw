@@ -140,7 +140,7 @@ class ControlConfig:
     # motorlar MAV_CMD_DO_MOTOR_TEST ile PERVANESİZ ve DÜŞÜK GAZDA sırayla döner
     # (uçuş moduna arm/GPS gerekmez). QR'da "SİGMA mekanizması tetiklenecek" içindir.
     # GÜVENLİK: pervaneleri çıkar, motor kollarını sabitle. Gaz üst sınırı düşük.
-    sigma_test_percent: float = 8.0         # her motor gaz yüzdesi (tezgah, pervanesiz)
+    sigma_test_percent: float = 25.0         # her motor gaz yüzdesi. DIKKAT: pervaneli testte gercek itki uretir
     sigma_test_seconds: float = 2.0         # her motorun döneceği süre (FC otomatik durdurur)
 
 

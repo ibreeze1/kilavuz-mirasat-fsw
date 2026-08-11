@@ -278,6 +278,11 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
     separation_started = False       # ayrılma dizisi başladı mı (latch: her çevrim güncelle)
     separation_confirmed = False     # ayrılma GERİ BİLDİRİMLE doğrulandı mı
     sigma_seen = commander.sigma_request_count   # 'SIGMA' komut kenarı tespiti için
+    sigma_stop_seen = commander.sigma_stop_count  # acil durdurma kenarı
+    sigma_son_yenileme = 0.0
+    sigma_baslangic = 0.0
+    SIGMA_YENILEME_S = 1.0      # komut suresi 2 sn; 1 sn'de bir yenilenir
+    SIGMA_UST_SINIR_S = 120.0   # baglanti koparsa test sonsuza surmesin
     arms_deployed = False
     motor_fault_prev = False
     last_link_ok_s = clk.now_monotonic()
@@ -333,6 +338,33 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
         # --- SİGMA motor yer-testi (QR): 'SIGMA' komutu sayacı arttıysa tetikle ---
         # Uplink veya --command üzerinden gelen her yeni 'SIGMA' komutunda bir kez
         # motor testi gönderilir (latch değil; tekrar tetiklenebilir). PERVANESİZ.
+        if commander.sigma_stop_count > sigma_stop_seen:
+            sigma_stop_seen = commander.sigma_stop_count
+            ms = sigma_actuator.stop()
+            log("ACİL DURDUR: motor STOP "
+                + ("gönderildi" if ms.is_ok else f"BAŞARISIZ: {ms.message}"))
+
+        # SIGMA testi aktifken komutu yenile.
+        #
+        # DO_MOTOR_TEST belirli sure calisir; yenilenmezse ArduPilot motorlari
+        # KENDILIGINDEN durdurur. Bu KASITLI bir guvenlik ozelligi: program
+        # cokerse veya donarsa motorlar 2 saniyede durur. Sonsuz sure vermek
+        # bu korumayi ortadan kaldirirdi.
+        if commander.sigma_running:
+            if sigma_baslangic == 0.0:
+                sigma_baslangic = clk.now_monotonic()
+
+            gecen = clk.now_monotonic() - sigma_baslangic
+            if gecen > SIGMA_UST_SINIR_S:
+                sigma_actuator.stop()
+                log(f"SİGMA: {SIGMA_UST_SINIR_S:.0f} sn üst sınır — test durduruldu")
+                sigma_baslangic = 0.0
+            elif clk.now_monotonic() - sigma_son_yenileme >= SIGMA_YENILEME_S:
+                sigma_son_yenileme = clk.now_monotonic()
+                sigma_actuator.trigger()
+        else:
+            sigma_baslangic = 0.0
+
         if commander.sigma_request_count > sigma_seen:
             sigma_seen = commander.sigma_request_count
             sr = sigma_actuator.trigger()
