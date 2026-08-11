@@ -153,6 +153,21 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
                 + ("açıldı" if link_open.is_ok else f"AÇILAMADI: {link_open.message}"))
     actuators = ActuatorSuite()
 
+    # FLIGHT profilinde ayrilma ve kanat servolari GERCEK MAVLink kanallarina
+    # baglanir. Parasut, motor ve buzzer mock kalir - kanallari henuz
+    # belirlenmedi ve yanlislikla surulmeleri tehlikeli olur.
+    if not config.is_simulation and mav_source is not None:
+        from src.drivers.real_actuators import (MavlinkServoSurucu,
+                                                RealSeparationServos,
+                                                RealWingDeploy)
+        _surucu = MavlinkServoSurucu(mav_source.connection)
+        if _surucu.is_available:
+            actuators.separation = RealSeparationServos(_surucu)
+            actuators.wings = RealWingDeploy(_surucu)
+            log("BOOT: ayrilma ve kanat servolari GERCEK (CH14/CH13/CH15)")
+        else:
+            log("BOOT: MAVLink baglantisi yok, servolar mock kaldi")
+
     # GÜVENLİK: başlangıçta Safe State (motorlar disarm, servolar güvenli).
     actuators.enter_safe_state()
     log("BOOT: aktüatörler Safe State'e alındı (SIMULATION_ONLY)")
