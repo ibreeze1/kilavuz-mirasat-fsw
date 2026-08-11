@@ -136,6 +136,13 @@ class ControlConfig:
     motor_rpm_tolerance: float = 0.35       # beklenen RPM'in %35 altı → tutarsız
     motor_fault_persist_s: float = 1.0      # tutarsızlık bu süre sürerse arıza
 
+    # SİGMA yer-testi (QR tezgah demosu): yer istasyonundan 'SIGMA' komutu gelince
+    # motorlar MAV_CMD_DO_MOTOR_TEST ile PERVANESİZ ve DÜŞÜK GAZDA sırayla döner
+    # (uçuş moduna arm/GPS gerekmez). QR'da "SİGMA mekanizması tetiklenecek" içindir.
+    # GÜVENLİK: pervaneleri çıkar, motor kollarını sabitle. Gaz üst sınırı düşük.
+    sigma_test_percent: float = 8.0         # her motor gaz yüzdesi (tezgah, pervanesiz)
+    sigma_test_seconds: float = 2.0         # her motorun döneceği süre (FC otomatik durdurur)
+
 
 @dataclass(frozen=True)
 class PixhawkConfig:

@@ -100,7 +100,11 @@ class FailsafeManager:
             and ctx.altitude_m > c.min_deploy_altitude_m   # >100 m kilidi
             and not speed_contradicted                     # çoklu-sensör onayı
         )
-        manual_trigger = ctx.manual_apam_cmd and ctx.altitude_m > c.min_deploy_altitude_m
+        # Manuel APAM: operatörün AÇIK kararı → irtifadan BAĞIMSIZ açılır (Şartname
+        # G-10 "Acil bir Durumda manuel paraşüt açma komutu gönderilerek
+        # aktifleştirilebilmelidir"; irtifa sınırı yalnız ALGORİTMİK tetiktedir).
+        # Bu, QR tezgah demosunda (irtifa ~0) 'APAM' komutunun paraşütü açmasını sağlar.
+        manual_trigger = ctx.manual_apam_cmd
 
         should_deploy = False
         reason = ""

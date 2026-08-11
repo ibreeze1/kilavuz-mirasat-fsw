@@ -25,13 +25,14 @@ from src.control.separation_sequencer import SeparationSequencer
 from src.drivers.apam_actuator import ApamActuator
 from src.drivers.factory import (
     check_profile_runnable,
+    create_actuators,
     create_flight_controller,
     create_mavlink_source,
     create_sensors,
     create_telemetry_link,
 )
 from src.drivers.flight_profile import FlightProfile
-from src.drivers.mock_actuators import ActuatorSuite
+from src.drivers.sigma_actuator import SigmaMotorActuator
 from src.drivers.mock_camera import MockCamera, MockWifiVideoLink
 from src.drivers.mock_sensors import MockIotLink, MockTelemetryLink
 from src.mission.context import FlightContext
@@ -94,7 +95,8 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
                   event_sink=None, motor_fault_factor: float = 1.0,
                   commands: "list[tuple[float, str]] | None" = None,
                   jam_window: "tuple[float, float] | None" = None,
-                  vibration: float = 0.0) -> RunSummary:
+                  vibration: float = 0.0,
+                  keep_servos: bool = False) -> RunSummary:
     """
     Sınırlı döngüyü kurar ve çalıştırır. `clock` verilmezse SimClock kullanılır
     (deterministik, gerçek zaman beklemesiz). `event_sink(str)` log satırlarını alır.
@@ -151,26 +153,22 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
             link_open = link.open()
             log("BOOT: LoRa telemetri linki "
                 + ("açıldı" if link_open.is_ok else f"AÇILAMADI: {link_open.message}"))
-    actuators = ActuatorSuite()
+    # SIMULATION → mock ActuatorSuite; FLIGHT/HIL → RealActuatorSuite (ayrılma
+    # CH14/CH13 ve kanat CH15 GERÇEK PCA9685'ten sürülür). Böylece 'AYIR' komutu
+    # ve otonom ayrılma gerçek servoları döndürür.
+    actuators = create_actuators(config, log)
+    if hasattr(actuators, "open"):                 # yalnız RealActuatorSuite (FLIGHT/HIL)
+        op = actuators.open(safe=not keep_servos)
+        log("BOOT: PCA9685 servo sürücüsü "
+            + ("açıldı" if op.is_ok else f"AÇILAMADI: {op.message} (mock-degrade)"))
 
-    # FLIGHT profilinde ayrilma ve kanat servolari GERCEK MAVLink kanallarina
-    # baglanir. Parasut, motor ve buzzer mock kalir - kanallari henuz
-    # belirlenmedi ve yanlislikla surulmeleri tehlikeli olur.
-    if not config.is_simulation and mav_source is not None:
-        from src.drivers.real_actuators import (MavlinkServoSurucu,
-                                                RealSeparationServos,
-                                                RealWingDeploy)
-        _surucu = MavlinkServoSurucu(mav_source.connection)
-        if _surucu.is_available:
-            actuators.separation = RealSeparationServos(_surucu)
-            actuators.wings = RealWingDeploy(_surucu)
-            log("BOOT: ayrilma ve kanat servolari GERCEK (CH14/CH13/CH15)")
-        else:
-            log("BOOT: MAVLink baglantisi yok, servolar mock kaldi")
-
-    # GÜVENLİK: başlangıçta Safe State (motorlar disarm, servolar güvenli).
-    actuators.enter_safe_state()
-    log("BOOT: aktüatörler Safe State'e alındı (SIMULATION_ONLY)")
+    # GÜVENLİK: başlangıçta Safe State (motorlar disarm, servolar güvenli konumda).
+    # --keep-servos: servolara DOKUNMA (tezgahta bench ile açılmış konumları korunur).
+    if keep_servos:
+        log("BOOT: --keep-servos → servolar olduğu konumda bırakıldı (boot kilidi yok)")
+    else:
+        actuators.enter_safe_state()
+        log("BOOT: aktüatörler Safe State'e alındı")
 
     # Servisler
     builder = TelemetryPacketBuilder(
@@ -190,6 +188,9 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
     if mav_source is not None:
         apam_connect_fn = lambda port, baud: mav_source.connection  # noqa: E731
     apam_actuator = ApamActuator(config, log=log, connect_fn=apam_connect_fn)
+    # SİGMA motor yer-testi (QR): 'SIGMA' komutuyla motorları PERVANESİZ düşük gazda
+    # döndürür. Paylaşılan MAVLink bağını kullanır (apam ile aynı); sim'de yalnız log.
+    sigma_actuator = SigmaMotorActuator(config, log=log, connect_fn=apam_connect_fn)
 
     # Uçuşa hazırlık (preflight) go/no-go kontrolü — FRR (Şartname §4.2).
     preflight = PreflightCheck(config.health).run(
@@ -276,6 +277,7 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
     # Döngü durumu
     separation_started = False       # ayrılma dizisi başladı mı (latch: her çevrim güncelle)
     separation_confirmed = False     # ayrılma GERİ BİLDİRİMLE doğrulandı mı
+    sigma_seen = commander.sigma_request_count   # 'SIGMA' komut kenarı tespiti için
     arms_deployed = False
     motor_fault_prev = False
     last_link_ok_s = clk.now_monotonic()
@@ -301,7 +303,9 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
     kosu_baslangici = clk.now_monotonic()
 
     cycle = 0
-    while cycle < max_cycles:
+    # max_cycles <= 0 → sınırsız koşu (uçuş/tezgah: FSW sürekli çalışmalı, telemetri
+    # akmalı, operatör komutu bekleyebilmeli). Pozitif değer sim/testte üst sınırdır.
+    while max_cycles <= 0 or cycle < max_cycles:
         cycle_start = clk.now_monotonic()
         t = mission_time()
         if duration_s is not None and (cycle_start - kosu_baslangici) >= duration_s:
@@ -325,6 +329,15 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
             log(f"KOMUT '{cmd_str}': "
                 f"{res.unwrap().detail if res.is_ok else 'RED - ' + res.message}")
             cmd_idx += 1
+
+        # --- SİGMA motor yer-testi (QR): 'SIGMA' komutu sayacı arttıysa tetikle ---
+        # Uplink veya --command üzerinden gelen her yeni 'SIGMA' komutunda bir kez
+        # motor testi gönderilir (latch değil; tekrar tetiklenebilir). PERVANESİZ.
+        if commander.sigma_request_count > sigma_seen:
+            sigma_seen = commander.sigma_request_count
+            sr = sigma_actuator.trigger()
+            log(f"SİGMA: motor yer-testi tetiklendi "
+                f"({'ok' if sr.is_ok else 'RED - ' + sr.message})")
 
         # --- MAVLink akışını boşalt (Mini Pix → cache); SIMULATION'da no-op ---
         if mav_source is not None:
@@ -367,8 +380,14 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
             elif sep_st.state.name == "FAULT":
                 log("SEPARATION: AYRILMA DOĞRULANAMADI (timeout) — geri bildirim yok, "
                     "kollar açılmıyor")
-        if separation_confirmed and not arms_deployed and \
-                state.phase in (FlightPhase.SEPARATION, FlightPhase.ARM_DEPLOY):
+        # Manuel ayrılmada faz kapısını baypas et: operatör butona bastıysa
+        # (yerde/tezgah demosu dahil) ayrılma onaylanınca kanat da açılmalı. Otonom
+        # ayrılmada kapı KORUNUR (uçuş güvenliği). Kanat yine separation_confirmed
+        # sonrası açılır → bench dizisiyle aynı sıra (önce ayrılma, sonra kanat).
+        allow_arm_deploy = (commander.manual_separation_requested
+                            or state.phase in (FlightPhase.SEPARATION,
+                                               FlightPhase.ARM_DEPLOY))
+        if separation_confirmed and not arms_deployed and allow_arm_deploy:
             # SİGMA kol açma koreografisi: zamanlı aç/kilitle + geri bildirim.
             arm_st = arm_sequencer.update(t, actuators.arms)
             if arm_st.complete:
@@ -403,8 +422,13 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
             health=hflags)
         decision = failsafe.update(ctx)
         if decision.apam_should_deploy:
+            # Şartname G-10: paraşütten HEMEN ÖNCE gerçek motorları durdur. Motorlar
+            # Mini Pix'te (execute_apam yalnız mock motoru keser) → Pixhawk'a gerçek
+            # motor STOP gönder, SONRA paraşüt servosunu (PCA9685) aç.
+            mstop = sigma_actuator.stop()
             res = failsafe.execute_apam(actuators)
-            log(f"APAM: {decision.reason} | sıra motor-kill→paraşüt "
+            log(f"APAM: {decision.reason} | motor STOP "
+                f"({'ok' if mstop.is_ok else mstop.message}) → paraşüt "
                 f"({'ok' if res.is_ok else res.message})")
         ctx.apam_active = decision.apam_active
         apam_ever = apam_ever or decision.apam_active
@@ -519,7 +543,11 @@ def build_and_run(config: AppConfig, max_cycles: int, duration_s: float | None,
                 time.sleep(period - elapsed)
 
     # KAPANIŞ: Safe State (güvenlik) + kamera durdur + MAVLink bağını kapat.
-    actuators.enter_safe_state()
+    # --keep-servos: kapanışta da servolara dokunma (açık kalsınlar).
+    if not keep_servos:
+        actuators.enter_safe_state()
+    if hasattr(actuators, "close"):                 # RealActuatorSuite: I²C'yi kapat
+        actuators.close()
     camera.stop()
     if mav_source is not None:
         mav_source.close()
@@ -559,7 +587,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default="simulation",
                         help="Çalışma profili (varsayılan: simulation)")
     parser.add_argument("--max-cycles", type=int, default=100,
-                        help="Maksimum döngü sayısı (sonsuz döngü önlemi)")
+                        help="Maksimum döngü sayısı (sonsuz döngü önlemi). "
+                             "0 veya negatif = SINIRSIZ (uçuş/tezgah için, Ctrl+C ile durdur)")
     parser.add_argument("--duration", type=float, default=None,
                         help="Simüle görev süresi (saniye) üst sınırı")
     parser.add_argument("--profile", default="nominal_descent",
@@ -577,6 +606,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="Titreşim gürültü şiddeti (FRR §4.2 analoğu, ör. 1.0)")
     parser.add_argument("--preflight", action="store_true",
                         help="Yalnız uçuşa hazırlık (preflight) kontrolünü çalıştır ve çık")
+    parser.add_argument("--keep-servos", action="store_true",
+                        help="Boot/kapanışta servolara DOKUNMA (tezgahta bench ile "
+                             "açılmış ayrılma/kanat/paraşüt servoları kilitlenmesin)")
     args = parser.parse_args(argv)
 
     jam = None
@@ -618,7 +650,7 @@ def main(argv: list[str] | None = None) -> int:
         config, max_cycles=args.max_cycles, duration_s=args.duration, clock=clock,
         profile_name=args.profile, event_sink=print,
         motor_fault_factor=args.motor_fault, commands=injected, jam_window=jam,
-        vibration=args.vibration)
+        vibration=args.vibration, keep_servos=args.keep_servos)
 
     print("--- KOŞU ÖZETİ ---")
     print(f"Preflight: {'GO' if summary.preflight_go else 'NO-GO'}")

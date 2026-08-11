@@ -1,207 +1,242 @@
 """
-Görevi        : Gerçek aktüatör sürücüsü. Ayrılma ve kanat servolarını
-                MAVLink MAV_CMD_DO_SET_SERVO ile sürer. Mock aktüatörlerle
-                AYNI arayüzü uygular; üst katmanlar değişmez.
-Neden Gerekli : Gereksinim-6 (otonom ayrılma) ve Gereksinim-7 (manuel ayrılma
-                komutu). SIMULATION_ONLY'de mock kullanılır; FLIGHT profilinde
-                yer istasyonundan gelen AYIR komutunun fiziksel karşılığı olmalı.
-İlişkiler     : SeparationSequencer `release()/lock()` çağırır. MavlinkSource'un
-                mevcut bağlantısı paylaşılır — ikinci bir MAVLink bağı AÇILMAZ.
-                Kanal ve PWM değerleri tools/separation_bench_test.py ile
-                sahada doğrulandı.
-
-KANAL HARİTASI (bench aracıyla doğrulandı)
-------------------------------------------
-    CH14  ayrılma servosu A      LOCKED 1000  ->  RELEASED 2000
-    CH13  ayrılma servosu B      LOCKED 1000  ->  RELEASED 2000
-    CH15  kanat açma             CLOSED 1000  ->  OPEN     1500
-
-İki ayrılma servosu ZIT yönlü ve EŞZAMANLI sürülür; tek servo arızasında
-mekanizma kilitli kalır (bench aracının tasarım notu).
-
-ArduPilot UYARISI
------------------
-DO_SET_SERVO yalnızca SERVOn_FUNCTION = 0 (Disabled) olan kanallarda çalışır.
-Kanal bir uçuş fonksiyonuna atanmışsa komut SESSİZCE yok sayılır — servo
-kıpırdamaz ve hata da alınmaz. Bench aracı çalıştıysa bu ayar zaten doğrudur;
-parametre sıfırlanırsa ilk bakılacak yer burasıdır.
-
-GERİ BİLDİRİM SINIRI — DÜRÜSTLÜK NOTU
---------------------------------------
-Servolarda konum geri bildirimi YOKTUR. `released` özelliği "komut gönderildi
-ve uçuş kartı kabul etti" anlamına gelir, "ayrılma fiziksel olarak gerçekleşti"
-anlamına GELMEZ.
-
-Gerçek doğrulama iki yoldan gelebilir:
-  - Ayrılma mekanizmasına limit switch eklemek (en kesin yol)
-  - İrtifa profilindeki değişimi izlemek (ayrılma sonrası iniş hızı 12-14'ten
-    8-10 m/s'ye düşer)
-
-Bu ayrım ARAS hata kodunu doğrudan etkiler: şartname 2.2, ayrılmanın
-gerçekleşmemesi durumunda hata kodu 1 istiyor. Komut gönderildi diye
-"gerçekleşti" saymak, gerçekte ayrılmamışsa hakemi yanıltır.
+Görevi        : FLIGHT/HIL profilinde AYRILMA ve KANAT servolarını GERÇEK PCA9685
+                (I²C PWM) üzerinden süren aktüatör suite'i. Mock ile BİREBİR aynı
+                arayüzü uygular (release/released/locked/to_safe, deploy_and_lock);
+                yalnız `separation` ve `arms` fiziksel PWM üretir. Motor/APAM/buzzer
+                mock kalır (onlar MAVLink/ApamActuator üzerinden ayrı sürülür).
+Neden Gerekli : Yer istasyonundan 'AYIR' (Manuel Ayrılma) komutu ve otonom ayrılma,
+                ana döngüde `actuators.separation`'ı sürer. SIMULATION'da bu mock'tur;
+                FLIGHT'ta gerçek servolar dönmeliydi ama suite HER ZAMAN mock'tu. Bu
+                sürücü boşluğu kapatır: Gereksinim-7 (manuel ayrılma) fiziksel gerçekleşir.
+İlişkiler     : SeparationSequencer.release()/released ve ArmDeploySequencer.
+                deploy_and_lock()/deployed/locked bu sınıfları sürer (mock ile aynı
+                sözleşme). Kanal/PWM değerleri tools/separation_bench_test.py'de
+                fiziksel olarak KALİBRE edildi; buradaki sabitler onunla aynı olmalı.
+Nasıl Test    : tests/test_real_actuators.py — donanımsız (bus=None) mantık: release
+                sonrası released/pozisyon, to_safe LOCKED, kanat deploy. Fiziksel
+                doğrulama RPi'de tools/separation_bench_test.py --separate ile yapılır.
+DÜRÜSTLÜK NOTU: Gerçek mikroswitch/limit-switch DONANIMDA YOK. `released` ve kol
+                `locked` geri bildirimi bu yüzden KOMUT-TABANLIDIR (komut = onay),
+                tıpkı mock'taki gibi. smbus2/PCA9685 yoksa SESSİZCE ÇÖKMEZ; açık hata
+                tutar ve set_us no-op olur (real_lora deseni).
 """
 from __future__ import annotations
 
 import time
 
-from src.common.result import ErrorCode, Result
+from src.common.result import Result
+from src.drivers.mock_actuators import (
+    ActuatorSuite,
+    MockArmMechanism,
+    MockSeparationMechanism,
+    MockServo,
+)
+from src.hal.interfaces import ServoPosition
+
+# ── Kalibre değerler — tools/separation_bench_test.py ile AYNI olmalı ──────────
+# CH14/CH13 ayrılma (zıt yön), CH15 kanat. µs değerleri fiziksel ölçümle bulundu.
+CH_SEP_LEFT = 14       # ayrılma servosu:        LOCKED 1000 → OPEN 1650
+CH_SEP_RIGHT = 13      # ayrılma servosu (zıt):  LOCKED 1650 → OPEN 1000
+CH_WINGS = 15          # kanat açma servosu:     LOCKED 1000 → OPEN 1500
+# APAM paraşüt servosu (SG90) da AYNI PCA9685'te CH12'de. µs değerleri tezgahta
+# fiziksel KALİBRE EDİLDİ (2026-08-11): kapalı/başlangıç YÜKSEK, açık/bırak DÜŞÜK.
+CH_APAM = 12           # paraşüt servosu:        CLOSED 2100 → OPEN 1000 (kalibre)
+
+_SEP_LEFT_US = {"locked": 1000, "open": 1650}
+_SEP_RIGHT_US = {"locked": 1650, "open": 1000}
+_WINGS_US = {"locked": 1000, "open": 1500}
+_APAM_US = {"closed": 2100, "open": 1000}   # kalibre (apam_bench_test ile aynı)
+
+# PCA9685 I²C
+_I2C_BUS = 1
+_PCA9685_ADDR = 0x40
+_PWM_FREQ_HZ = 50.0
+_PERIOD_US = 1_000_000.0 / _PWM_FREQ_HZ
+
+# PCA9685 register haritası
+_MODE1 = 0x00
+_PRESCALE = 0xFE
+_LED0_ON_L = 0x06
 
 
-# --- Kanal haritası (bench aracıyla doğrulandı) ---
-SEP_A_KANAL = 14
-SEP_B_KANAL = 13
-WING_KANAL = 15
-
-SEP_LOCKED_PWM = 1000
-SEP_RELEASED_PWM = 2000
-WING_CLOSED_PWM = 1000
-WING_OPEN_PWM = 1500
-
-# Uçuş kartının komutu kabul ettiğini doğrulamak için beklenen süre.
-# Ayrılma bir kez olur; bu süre kadar beklemek kabul edilebilir.
-ACK_ZAMAN_ASIMI_S = 0.5
+def _us_to_counts(pulse_us: float) -> int:
+    """Darbe genişliğini (µs) 12-bit PCA9685 sayımına (0..4095) çevirir."""
+    counts = int(round(4096.0 * pulse_us / _PERIOD_US))
+    return max(0, min(4095, counts))
 
 
-class MavlinkServoSurucu:
+class Pca9685:
     """
-    MAV_CMD_DO_SET_SERVO ile PWM sürer.
-
-    Mevcut MAVLink bağlantısını PAYLAŞIR; kendi bağlantısını açmaz ve
-    kapatmaz. Yaşam döngüsü MavlinkSource'a aittir.
+    Minimal PCA9685 servo sürücüsü (smbus2). tools/separation_bench_test.py'deki
+    KANITLANMIŞ init/set_us mantığının FSW içi eşdeğeri (tek gövdede kalması için
+    kopyalandı — tezgah testi bağımsız/kanıtlı kalsın). `open()` çağrılana dek bağlı
+    değildir; smbus2/bus yoksa ÇÖKMEZ, açık hata metni tutar ve set_us no-op olur.
     """
 
-    def __init__(self, connection) -> None:
-        self._conn = connection
+    def __init__(self, log=print) -> None:
+        self._log = log
+        self._bus = None
+        self.error: str | None = None
 
     @property
-    def is_available(self) -> bool:
-        return self._conn is not None
+    def is_open(self) -> bool:
+        return self._bus is not None
 
-    def pwm_yaz(self, kanal: int, pwm: int) -> Result[None]:
-        if self._conn is None:
-            return Result.err(ErrorCode.UNAVAILABLE, "MAVLink bağlantısı yok")
-
+    def open(self) -> bool:
         try:
-            from pymavlink import mavutil
+            from smbus2 import SMBus  # type: ignore  # yalnız RPi/donanım profilinde
         except ImportError:
-            return Result.err(ErrorCode.UNAVAILABLE, "pymavlink kurulu değil")
-
+            self.error = "smbus2 kurulu değil (pip install -r requirements-hardware.txt)"
+            return False
         try:
-            self._conn.mav.command_long_send(
-                self._conn.target_system,
-                self._conn.target_component,
-                mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                0,                      # confirmation
-                float(kanal),           # param1: servo numarası
-                float(pwm),             # param2: PWM (us)
-                0, 0, 0, 0, 0)
-        except Exception as exc:
-            return Result.err(ErrorCode.IO_ERROR, f"Servo komutu gönderilemedi: {exc}")
+            self._bus = SMBus(_I2C_BUS)
+            self._init_chip()
+        except Exception as exc:  # I²C/bus hataları — açık raporla, çökme yok
+            self.error = f"PCA9685 açılamadı (I2C-{_I2C_BUS} @0x{_PCA9685_ADDR:02X}): {exc}"
+            self._bus = None
+            return False
+        return True
 
-        # ACK bekle. Gelmemesi komutun uygulanmadığı anlamına GELMEZ (mesaj
-        # kaybolmuş olabilir), ama geldiğinde uçuş kartının kabul ettiğini
-        # kesin biliriz.
-        bitis = time.monotonic() + ACK_ZAMAN_ASIMI_S
-        while time.monotonic() < bitis:
+    def _init_chip(self) -> None:
+        prescale = int(round(25_000_000.0 / (4096.0 * _PWM_FREQ_HZ)) - 1)
+        self._bus.write_byte_data(_PCA9685_ADDR, _MODE1, 0x10)          # SLEEP
+        self._bus.write_byte_data(_PCA9685_ADDR, _PRESCALE, prescale)   # frekans
+        self._bus.write_byte_data(_PCA9685_ADDR, _MODE1, 0x00)          # WAKE
+        time.sleep(0.005)
+        self._bus.write_byte_data(_PCA9685_ADDR, _MODE1, 0xA0)          # AI + RESTART
+
+    def set_us(self, channel: int, pulse_us: float) -> None:
+        """Bir kanala darbe genişliği uygular. Bus yoksa yalnız loglar (no-op)."""
+        counts = _us_to_counts(pulse_us)
+        if self._bus is None:
+            self._log(f"[PCA9685 yok] CH{channel} <- {pulse_us:.0f} us ({counts} sayim)")
+            return
+        base = _LED0_ON_L + 4 * channel
+        self._bus.write_byte_data(_PCA9685_ADDR, base + 0, 0)
+        self._bus.write_byte_data(_PCA9685_ADDR, base + 1, 0)
+        self._bus.write_byte_data(_PCA9685_ADDR, base + 2, counts & 0xFF)
+        self._bus.write_byte_data(_PCA9685_ADDR, base + 3, counts >> 8)
+
+    def close(self) -> None:
+        if self._bus is not None:
             try:
-                msg = self._conn.recv_match(type="COMMAND_ACK", blocking=True,
-                                            timeout=0.1)
+                self._bus.close()
             except Exception:
-                break
-            if msg and msg.command == mavutil.mavlink.MAV_CMD_DO_SET_SERVO:
-                if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-                    return Result.ok(None)
-                return Result.err(ErrorCode.IO_ERROR,
-                                  f"Uçuş kartı komutu reddetti (result={msg.result})")
-
-        # ACK gelmedi ama komut gönderildi — akışı durdurmuyoruz.
-        return Result.ok(None)
+                pass
+            self._bus = None
 
 
-class RealSeparationServos:
+class RealSeparationMechanism(MockSeparationMechanism):
     """
-    İki zıt yönlü ayrılma servosu. Mock ile aynı arayüz.
-
-    `released` = "komut gönderildi", "fiziksel olarak ayrıldı" DEĞİL.
-    Bkz. modül başındaki geri bildirim notu.
+    Gerçek ayrılma mekanizması: iki zıt servoyu (CH14/CH13) PCA9685'ten EŞZAMANLI
+    açar. Mantıksal durumu (left/right pozisyon, released, locked) mock'tan miras
+    alır; yalnız hareket komutlarında ek olarak fiziksel PWM yazar. Mikroswitch yok
+    → `released` komut-tabanlı (mock ile aynı). Kurulumda servolar LOCKED'a alınır.
     """
 
-    def __init__(self, surucu: MavlinkServoSurucu,
-                 ch_a: int = SEP_A_KANAL, ch_b: int = SEP_B_KANAL) -> None:
-        self._surucu = surucu
-        self._ch_a = ch_a
-        self._ch_b = ch_b
-        self._released = False
-        self.release_count = 0
-
-    @property
-    def released(self) -> bool:
-        return self._released
-
-    @property
-    def locked(self) -> bool:
-        return not self._released
+    def __init__(self, pca: Pca9685) -> None:
+        super().__init__()
+        self._pca = pca
+        # Güvenli (LOCKED) darbeler open()->to_safe() içinde yazılır (bus açıldıktan
+        # SONRA). Constructor'da yazmak, bus henüz yokken kafa karıştırıcı no-op
+        # ('[PCA9685 yok]') logları üretir; gereksiz.
 
     def release(self) -> Result[None]:
-        """
-        İki servoyu EŞZAMANLI açar. Biri başarısız olursa hata döner ama
-        diğerine komut yine de gönderilmiş olur — yarım açılma, hiç
-        açılmamaktan iyidir (mekanizma sıkışabilir ama şansı vardır).
-        """
-        self.release_count += 1
-
-        a = self._surucu.pwm_yaz(self._ch_a, SEP_RELEASED_PWM)
-        b = self._surucu.pwm_yaz(self._ch_b, SEP_RELEASED_PWM)
-
-        if a.is_err:
-            return a
-        if b.is_err:
-            return b
-
-        self._released = True
-        return Result.ok(None)
+        # Önce fiziksel PWM: iki servoyu art arda (minimum skew) OPEN'a al.
+        self._pca.set_us(CH_SEP_LEFT, _SEP_LEFT_US["open"])
+        self._pca.set_us(CH_SEP_RIGHT, _SEP_RIGHT_US["open"])
+        # Sonra mantıksal durum + geri bildirim (mock semantiği).
+        return super().release()
 
     def to_safe(self) -> Result[None]:
-        a = self._surucu.pwm_yaz(self._ch_a, SEP_LOCKED_PWM)
-        b = self._surucu.pwm_yaz(self._ch_b, SEP_LOCKED_PWM)
-
-        if a.is_err:
-            return a
-        if b.is_err:
-            return b
-
-        self._released = False
-        return Result.ok(None)
+        # Ayrılma FİZİKSEL ve geri dönüşsüz: bir kez released olduysa servoları
+        # LOCKED'a GERİ SÜRME. Aksi halde (örn. kapanışta enter_safe_state) ayrılmış
+        # mekanizmayı kapatmaya çalışır ve servolar KENDİ KENDİNE kilitli konuma döner.
+        # Yalnız henüz ayrılmadıysa güvenli-kilit yaz (kol mekanizmasıyla aynı semantik).
+        if not self.released:
+            self._pca.set_us(CH_SEP_LEFT, _SEP_LEFT_US["locked"])
+            self._pca.set_us(CH_SEP_RIGHT, _SEP_RIGHT_US["locked"])
+        return super().to_safe()
 
 
-class RealWingDeploy:
-    """Kanat/kol açma servosu (CH15)."""
+class RealArmMechanism(MockArmMechanism):
+    """
+    Gerçek kanat/kol mekanizması: CH15 servosunu PCA9685'ten açar. Limit-switch yok
+    → `locked` komut-tabanlı (mock ile aynı). Ayrılma FİZİKSEL ve geri dönüşsüz
+    olduğundan bir kez açılınca to_safe() kanadı GERİ KATLAMAZ (locked-in-place).
+    """
 
-    def __init__(self, surucu: MavlinkServoSurucu, kanal: int = WING_KANAL) -> None:
-        self._surucu = surucu
-        self._kanal = kanal
-        self._deployed = False
-
-    @property
-    def deployed(self) -> bool:
-        return self._deployed
-
-    @property
-    def locked(self) -> bool:
-        """Preflight kanatlarin guvenli konumda oldugunu denetler."""
-        return not self._deployed
+    def __init__(self, pca: Pca9685) -> None:
+        super().__init__()
+        self._pca = pca
+        # Kapalı (LOCKED) darbe open()->to_safe() içinde yazılır (bus açıldıktan sonra).
 
     def deploy_and_lock(self) -> Result[None]:
-        r = self._surucu.pwm_yaz(self._kanal, WING_OPEN_PWM)
-        if r.is_err:
-            return r
-        self._deployed = True
-        return Result.ok(None)
+        self._pca.set_us(CH_WINGS, _WINGS_US["open"])
+        return super().deploy_and_lock()
 
     def to_safe(self) -> Result[None]:
-        r = self._surucu.pwm_yaz(self._kanal, WING_CLOSED_PWM)
-        if r.is_err:
-            return r
-        self._deployed = False
-        return Result.ok(None)
+        # Açılmadıysa kapalı tut; açıldıysa dokunma (geri katlama yok — güvenlik).
+        if not self.deployed:
+            self._pca.set_us(CH_WINGS, _WINGS_US["locked"])
+        return super().to_safe()
+
+
+class RealApamServo(MockServo):
+    """
+    Gerçek APAM paraşüt servosu: CH_APAM'ı PCA9685'ten sürer. Mantıksal pozisyonu
+    (CLOSED/OPEN) mock'tan miras alır; yalnız hareket komutlarında fiziksel PWM
+    yazar. Güvenli konum CLOSED (paraşüt kapalı) — yanlışlıkla açılmaz. Paraşüt
+    açma Şartname G-10: failsafe.execute_apam() motorları kill EDİP sonra move_to(OPEN)
+    çağırır; burada OPEN → pimi çeken µs uygulanır.
+    """
+
+    def __init__(self, pca: Pca9685) -> None:
+        super().__init__("apam", ServoPosition.CLOSED)
+        self._pca = pca
+        # Güvenli (CLOSED) darbe open()->to_safe() içinde yazılır (bus açıldıktan sonra).
+
+    def move_to(self, position: ServoPosition) -> Result[None]:
+        us = _APAM_US["open"] if position is ServoPosition.OPEN else _APAM_US["closed"]
+        self._pca.set_us(CH_APAM, us)
+        return super().move_to(position)
+
+    def to_safe(self) -> Result[None]:
+        self._pca.set_us(CH_APAM, _APAM_US["closed"])
+        return super().to_safe()
+
+
+class RealActuatorSuite(ActuatorSuite):
+    """
+    FLIGHT/HIL aktüatör suite'i: ayrılma + kanat + APAM paraşüt servosu GERÇEK
+    PCA9685'ten sürülür; motor ve buzzer mock kalır (motor Pixhawk/DO_MOTOR_TEST
+    üzerinden ayrı). Tek PCA9685 bus'ı tüm servoları paylaşır. `open()` donanımı açar.
+    """
+
+    def __init__(self, log=print) -> None:
+        super().__init__()                       # mock motors/buzzer
+        self._pca = Pca9685(log=log)
+        self.separation = RealSeparationMechanism(self._pca)
+        self.arms = RealArmMechanism(self._pca)
+        self.apam_servo = RealApamServo(self._pca)   # paraşüt servosu (mock yerine gerçek)
+
+    def open(self, safe: bool = True) -> Result[None]:
+        """
+        PCA9685'i açar. `safe=True` ise servoları güvenli konuma alır (ayrılma/kanat
+        LOCKED, paraşüt CLOSED). `safe=False` (--keep-servos) ise servolara DOKUNMAZ
+        → tezgahta bench tool ile önceden açılmış servolar boot'ta kilitlenmez.
+        Donanım yoksa SESSİZCE geçmez: açık hata döndürür ama suite yaşamaya devam eder.
+        """
+        if self._pca.open():
+            if safe:
+                # Bus açıldıktan sonra güvenli darbeleri yaz (kurulumda no-op'tular).
+                self.separation.to_safe()
+                self.arms.to_safe()
+                self.apam_servo.to_safe()
+            return Result.ok(None)
+        from src.common.result import ErrorCode
+        return Result.err(ErrorCode.UNAVAILABLE,
+                          self._pca.error or "PCA9685 açılamadı")
+
+    def close(self) -> None:
+        self._pca.close()

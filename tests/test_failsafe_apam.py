@@ -75,11 +75,13 @@ def test_manual_apam_triggers_above_100m():
     assert dec.apam_active and dec.trigger is ApamTrigger.MANUAL
 
 
-def test_manual_apam_blocked_below_100m():
+def test_manual_apam_deploys_below_100m():
+    """Manuel APAM irtifadan BAĞIMSIZ açılır (operatör kararı; QR tezgah demosu
+    için de gerekli). İrtifa sınırı yalnız ALGORİTMİK tetikte geçerlidir."""
     fm = FailsafeManager(ApamConfig())
     dec = fm.update(_ctx(0.0, descent_speed_mps=9.0, manual_apam_cmd=True,
-                         altitude_m=50.0))
-    assert not dec.apam_active
+                         altitude_m=0.0))
+    assert dec.apam_active and dec.trigger is ApamTrigger.MANUAL
 
 
 def test_link_loss_alone_does_not_trigger():

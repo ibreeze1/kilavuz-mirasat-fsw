@@ -99,6 +99,24 @@ def create_sensors(config: AppConfig, clock, profile, mission_time, source=None)
             MavlinkGps(source), MavlinkBattery(source))
 
 
+def create_actuators(config: AppConfig, log=print):
+    """
+    Aktüatör suite'i döndürür. SIMULATION_ONLY → mock ActuatorSuite (fiziksel PWM
+    yok, yalnız komut logu); FLIGHT/HIL → RealActuatorSuite (ayrılma CH14/CH13 ve
+    kanat CH15 GERÇEK PCA9685'ten sürülür). Böylece 'AYIR' (Manuel Ayrılma) komutu
+    ve otonom ayrılma gerçek servoları döndürür. Motor/APAM/buzzer her iki profilde
+    de mock kalır (MAVLink/ApamActuator üzerinden ayrı sürülür).
+
+    FLIGHT/HIL'de PCA9685 open() ana döngüde çağrılır (donanım yoksa açık hata
+    loglanır, suite set_us no-op ile yaşamaya devam eder — güvenli degrade).
+    """
+    if config.profile is RunProfile.SIMULATION_ONLY:
+        from src.drivers.mock_actuators import ActuatorSuite
+        return ActuatorSuite()
+    from src.drivers.real_actuators import RealActuatorSuite
+    return RealActuatorSuite(log=log)
+
+
 def create_flight_controller(config: AppConfig, clock, source=None, attitude_fn=None):
     """
     Uçuş kontrol kartı bağı döndürür. SIMULATION_ONLY → SimulatedFlightControllerLink
